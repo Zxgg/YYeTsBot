@@ -27,14 +27,14 @@ ZHUIXINFAN_SEARCH = "http://www.fanxinzhui.com/list?k={}"
 ZHUIXINFAN_RESOURCE = "http://www.fanxinzhui.com{}"
 # yyets website
 DOMAIN = "https://yyets.dmesg.app/"
-WORKERS = f"{DOMAIN}resource.html?id=%s"
+WORKERS = f"{DOMAIN}resource?id=" + "{}"
 
 # new zmz
 NEWZMZ_SEARCH = "https://newzmz.com/subres/index/getres.html?keyword={}"
 NEWZMZ_RESOURCE = "https://ysfx.tv/view/{}"
 
 # BD2020
-BD2020_SEARCH = "https://www.bd2020.com/search.jspx?q={}"
+BD2020_SEARCH = "https://v.bd2020.me/search.jspx?q={}"
 
 # XL720
 XL720_SEARCH = "https://www.xl720.com/?s={}"
@@ -53,4 +53,4 @@ MONGO = os.getenv("MONGO") or "mongo"
 MAINTAINER = os.getenv("MAINTAINER")
 REPORT = os.getenv("REPORT") or False
 # This name must match class name, other wise this bot won't running.
-FANSUB_ORDER: str = os.getenv("ORDER") or 'YYeTsOffline,NewzmzOnline,ZhuixinfanOnline,XL720,BD2020'
+FANSUB_ORDER: str = os.getenv("ORDER") or 'YYeTsOffline,ZimuxiaOnline,NewzmzOnline,ZhuixinfanOnline,XL720,BD2020'

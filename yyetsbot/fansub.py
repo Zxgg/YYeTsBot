@@ -183,16 +183,16 @@ class YYeTsOffline(BaseFansub):
         projection = {'_id': False, 'data.info': True}
         data = self.collection.find({
             "$or": [
-                {"data.info.cnname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
-                {"data.info.enname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
-                {"data.info.aliasname": {"$regex": f".*{search_text}.*", "$options": "-i"}},
+                {"data.info.cnname": {"$regex": f".*{search_text}.*", "$options": "i"}},
+                {"data.info.enname": {"$regex": f".*{search_text}.*", "$options": "i"}},
+                {"data.info.aliasname": {"$regex": f".*{search_text}.*", "$options": "i"}},
             ]},
             projection
         )
         results = {}
         for item in data:
             info = item["data"]["info"]
-            url = "https://yyets.dmesg.app/resource.html?id={}".format(info["id"])
+            url = WORKERS.format(info["id"])
             url_hash = hashlib.sha1(url.encode('u8')).hexdigest()
             all_name = info["cnname"] + info["enname"] + info["aliasname"]
             results[url_hash] = {
@@ -203,9 +203,9 @@ class YYeTsOffline(BaseFansub):
 
         logging.info("[%s] Offline resource search complete", self.__class__.__name__)
 
-        comments = self.db["comment"].find({"content": {"$regex": f".*{search_text}.*", "$options": "-i"}})
+        comments = self.db["comment"].find({"content": {"$regex": f".*{search_text}.*", "$options": "i"}})
         for c in comments:
-            url = "https://yyets.dmesg.app/resource.html?id={}#{}".format(c["resource_id"], str(c["_id"]))
+            url = WORKERS + "#{}".format(c["resource_id"], str(c["_id"]))
             url_hash = hashlib.sha1(url.encode('u8')).hexdigest()
             all_name = c["content"]
             results[url_hash] = {
@@ -237,7 +237,7 @@ class YYeTsOffline(BaseFansub):
             rid = resource_url.split("id=")[1]
             data: dict = self.collection.find_one({"data.info.id": int(rid)}, {'_id': False})
             name = data["data"]["info"]["cnname"]
-            share = WORKERS % rid
+            share = WORKERS.format(rid)
             t = "resource"
 
         return {"all": json.dumps(data, ensure_ascii=False, indent=4), "share": share, "cnname": name, "type": t}
@@ -277,7 +277,7 @@ class ZimuxiaOnline(BaseFansub):
         html = self.get_html(resource_url)
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("|")[0]
-        return {"all": html, "share": resource_url, "cnname": cnname}
+        return {"all": html, "share": resource_url, "cnname": cnname, "type": "resource"}
 
 
 class ZhuixinfanOnline(BaseFansub):
@@ -315,7 +315,7 @@ class ZhuixinfanOnline(BaseFansub):
         # 解析获得cnname等信息
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("_")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class NewzmzOnline(BaseFansub):
@@ -346,7 +346,7 @@ class NewzmzOnline(BaseFansub):
         # 解析获得cnname等信息
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("-")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class BD2020(NewzmzOnline):
@@ -405,7 +405,7 @@ class XL720(BD2020):
         html = self.get_html(url)
         soup = BeautifulSoup(html, 'html.parser')
         cnname = soup.title.text.split("迅雷下载")[0]
-        return {"all": html, "share": url, "cnname": cnname}
+        return {"all": html, "share": url, "cnname": cnname, "type": "resource"}
 
 
 class FansubEntrance(BaseFansub):
@@ -460,9 +460,9 @@ for sub_name in globals().copy():
         vars()[cmd_name] = m
 
 if __name__ == '__main__':
-    sub = BD2020()
-    search = sub.search_preview("我老婆要嫁人")
+    sub = ZimuxiaOnline()
+    search = sub.search_preview("最爱")
     print(search)
-    # uh = "a0702952077718cb9d1e08dca3485c51d5deee6e"
-    # result = sub.search_result(uh)
-    # print(json.dumps(result, ensure_ascii=False))
+    uh = "4bcd33af9be2fba0060c388e984c7a2509e7e654"
+    result = sub.search_result(uh)
+    print(json.dumps(result, ensure_ascii=False))

@@ -37,15 +37,18 @@ from database import (AnnouncementResource, BlacklistResource, CaptchaResource,
                       NameResource, NotificationResource, OtherResource, Redis,
                       ResourceLatestResource, ResourceResource, TopResource,
                       UserEmailResource, UserResource)
-from utils import check_spam, send_mail, ts_date
+from utils import Cloudflare, check_spam, send_mail, ts_date
 
 lib_path = pathlib.Path(__file__).parent.parent.joinpath("yyetsbot").resolve().as_posix()
 sys.path.append(lib_path)
 from fansub import BD2020, XL720, NewzmzOnline, ZhuixinfanOnline, ZimuxiaOnline
 
+logging.info("Loading fansub...%s", (BD2020, XL720, NewzmzOnline, ZhuixinfanOnline, ZimuxiaOnline))
+
 mongo_host = os.getenv("mongo") or "localhost"
 DOUBAN_SEARCH = "https://www.douban.com/search?cat=1002&q={}"
 DOUBAN_DETAIL = "https://movie.douban.com/subject/{}/"
+cf = Cloudflare()
 
 
 class Mongo:
@@ -66,6 +69,9 @@ class Mongo:
         r = self.db["users"].find_one({"username": username, "status.disable": True})
         if r:
             return r["status"]["reason"]
+
+    def is_old_user(self, username: str) -> bool:
+        return bool(self.db["users"].find_one({"username": username, "oldUser": True}))
 
 
 class FakeMongoResource:
@@ -91,6 +97,15 @@ class OtherMongoResource(OtherResource, Mongo):
         self.db["history"].insert_one(result)
         # reset
         self.db["yyets"].update_many({}, {"$set": {"data.info.views": 0}})
+
+    def import_ban_user(self):
+        usernames = self.db["users"].find({"status.disable": True}, projection={"username": True})
+        r = Redis().r
+        r.delete("user_blacklist")
+        logging.info("Importing ban users to redis...%s", usernames)
+        for username in [u["username"] for u in usernames]:
+            r.hset("user_blacklist", username, 100)
+        r.close()
 
 
 class AnnouncementMongoResource(AnnouncementResource, Mongo):
@@ -146,8 +161,9 @@ class CommentMongoResource(CommentResource, Mongo):
             item["id"] = str(item["_id"])
             item.pop("_id")
             for child in item.get("children", []):
-                child["id"] = str(child["_id"])
-                child.pop("_id")
+                with contextlib.suppress(Exception):
+                    child["id"] = str(child["_id"])
+                    child.pop("_id")
 
     def find_children(self, parent_data):
         for item in parent_data:
@@ -170,7 +186,7 @@ class CommentMongoResource(CommentResource, Mongo):
     def get_user_group(self, data):
         for comment in data:
             username = comment["username"]
-            user = self.db["users"].find_one({"username": username})
+            user = self.db["users"].find_one({"username": username}) or {}
             group = user.get("group", ["user"])
             comment["group"] = group
 
@@ -210,6 +226,11 @@ class CommentMongoResource(CommentResource, Mongo):
 
     def add_comment(self, captcha: str, captcha_id: int, content: str, resource_id: int,
                     ip: str, username: str, browser: str, parent_comment_id=None) -> dict:
+        user_data = self.db["users"].find_one({"username": username})
+        # old user is allowed to comment without verification
+        if not self.is_old_user(username) and user_data.get("email", {}).get("verified", False) is False:
+            return {"status_code": HTTPStatus.TEMPORARY_REDIRECT,
+                    "message": "你需要验证邮箱才能评论，请到个人中心进行验证"}
         returned = {"status_code": 0, "message": ""}
         # check if this user is blocked
         reason = self.is_user_blocked(username)
@@ -229,14 +250,13 @@ class CommentMongoResource(CommentResource, Mongo):
             SpamProcessMongoResource.request_approval(document)
             return {"status_code": HTTPStatus.FORBIDDEN, "message": f"possible spam, reference id: {inserted_id}"}
 
-        user_group = self.db["users"].find_one(
-            {"username": username},
-            projection={"group": True, "_id": False}
-        )
+        user_group = user_data.get("group", [])
         if not user_group:
             # admin don't have to verify code
             verify_result = CaptchaResource().verify_code(captcha, captcha_id)
-            if not verify_result["status"]:
+            if os.getenv("PYTHON_DEV"):
+                pass
+            elif not verify_result["status"]:
                 returned["status_code"] = HTTPStatus.BAD_REQUEST
                 returned["message"] = verify_result["message"]
                 return returned
@@ -290,7 +310,6 @@ class CommentMongoResource(CommentResource, Mongo):
                 upsert=True
             )
             # send email
-            # TODO unsubscribe
             parent_comment = self.db["comment"].find_one({"_id": ObjectId(parent_comment_id)})
             if resource_id == 233:
                 link = f"https://yyets.dmesg.app/discuss#{parent_comment_id}"
@@ -300,9 +319,13 @@ class CommentMongoResource(CommentResource, Mongo):
             if user_info:
                 subject = "[人人影视下载分享站] 你的评论有了新的回复"
                 pt_content = content.split("</reply>")[-1]
-                body = f"{username} 您好，<br>你的评论 {parent_comment['content']} 有了新的回复：<br>{pt_content}" \
+                text = f"你的评论 {parent_comment['content']} 有了新的回复：<br>{pt_content}" \
                        f"<br>你可以<a href='{link}'>点此链接</a>查看<br><br>请勿回复此邮件"
-                send_mail(user_info["email"]["address"], subject, body)
+                context = {
+                    "username": username,
+                    "text": text
+                }
+                send_mail(user_info["email"]["address"], subject, context)
         return returned
 
     def delete_comment(self, comment_id):
@@ -415,11 +438,31 @@ class CommentNewestMongoResource(CommentNewestResource, CommentMongoResource, Mo
 class CommentSearchMongoResource(CommentNewestMongoResource):
 
     def get_comment(self, page: int, size: int, keyword="") -> dict:
-        self.condition.update(content={'$regex': f'.*{keyword}.*', "$options": "-i"})
-        return super(CommentSearchMongoResource, self).get_comment(page, size, keyword)
+        self.projection.pop("children")
+        self.condition.update(content={'$regex': f'.*{keyword}.*', "$options": "i"})
+        data = list(self.db["comment"].find(self.condition, self.projection).
+                    sort("_id", pymongo.DESCENDING).
+                    limit(size).skip((page - 1) * size))
+        self.convert_objectid(data)
+        self.get_user_group(data)
+        self.extra_info(data)
+        self.fill_children(data)
+        # final step - remove children
+        for i in data:
+            i.pop("children", None)
+        return {
+            "data": data,
+        }
 
-    def extra_info(self, data):
-        pass
+    def fill_children(self, data):
+        for item in data:
+            child_id: "list" = item.get("children", [])
+            children = list(self.db["comment"].find(
+                {"_id": {"$in": child_id}}, self.projection).sort("_id", pymongo.DESCENDING))
+            self.convert_objectid(children)
+            self.get_user_group(children)
+            self.extra_info(children)
+            data.extend(children)
 
 
 class GrafanaQueryMongoResource(GrafanaQueryResource, Mongo):
@@ -503,11 +546,12 @@ class ResourceMongoResource(ResourceResource, Mongo):
             return []
 
     def get_resource_data(self, resource_id: int, username: str) -> dict:
-        data = self.db["yyets"].find_one_and_update(
+        data: "dict" = self.db["yyets"].find_one_and_update(
             {"data.info.id": resource_id},
             {'$inc': {'data.info.views': 1}},
             {'_id': False})
-
+        if not data:
+            return {}
         if username:
             user_like_data = self.db["users"].find_one({"username": username})
             if user_like_data and resource_id in user_like_data.get("like", []):
@@ -517,7 +561,9 @@ class ResourceMongoResource(ResourceResource, Mongo):
         return data
 
     def search_resource(self, keyword: str) -> dict:
-        final = []
+        order = os.getenv("ORDER") or 'YYeTsOffline,ZimuxiaOnline,NewzmzOnline,ZhuixinfanOnline,XL720,BD2020'.split(",")
+        order.pop(0)
+        zimuzu_data = []
         returned = {}
 
         projection = {'_id': False,
@@ -526,16 +572,16 @@ class ResourceMongoResource(ResourceResource, Mongo):
 
         resource_data = self.db["yyets"].find({
             "$or": [
-                {"data.info.cnname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
-                {"data.info.enname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
-                {"data.info.aliasname": {'$regex': f'.*{keyword}.*', "$options": "-i"}},
+                {"data.info.cnname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
+                {"data.info.enname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
+                {"data.info.aliasname": {'$regex': f'.*{keyword}.*', "$options": "i"}},
             ]},
             projection
         )
 
         for item in resource_data:
             item["data"]["info"]["origin"] = "yyets"
-            final.append(item["data"]["info"])
+            zimuzu_data.append(item["data"]["info"])
 
         # get comment
         r = CommentSearchMongoResource().get_comment(1, 2 ** 10, keyword)
@@ -543,31 +589,34 @@ class ResourceMongoResource(ResourceResource, Mongo):
         for c in r.get("data", []):
             comment_rid = c["resource_id"]
             d = self.db["yyets"].find_one({"data.info.id": comment_rid}, projection={"data.info": True})
-            c_search.append(
-                {
-                    "username": c["username"],
-                    "date": c["date"],
-                    "comment": c["content"],
-                    "commentID": c["id"],
-                    "resourceID": comment_rid,
-                    "resourceName": d["data"]["info"]["cnname"],
-                    "origin": "comment"
-                }
-            )
+            if d:
+                c_search.append(
+                    {
+                        "username": c["username"],
+                        "date": c["date"],
+                        "comment": c["content"],
+                        "commentID": c["id"],
+                        "resourceID": comment_rid,
+                        "resourceName": d["data"]["info"]["cnname"],
+                        "origin": "comment"
+                    }
+                )
 
-        if final:
-            returned = dict(data=final)
+        if zimuzu_data:
+            returned = dict(data=zimuzu_data)
             returned["extra"] = []
         else:
-            # TODO how to generate code using ORDER here
-            extra = self.fansub_search(NewzmzOnline.__name__, keyword) or \
-                    self.fansub_search(ZhuixinfanOnline.__name__, keyword) or \
-                    self.fansub_search(XL720.__name__, keyword) or \
-                    self.fansub_search(BD2020.__name__, keyword)
+            # only returned when no data found
+            extra = []
+            with contextlib.suppress(requests.exceptions.RequestException):
+                for name in order:
+                    extra = self.fansub_search(name, keyword)
+                    if extra:
+                        break
 
             returned["data"] = []
             returned["extra"] = extra
-        # add comment data here
+        # comment data will always be returned
         returned["comment"] = c_search
         return returned
 
@@ -652,13 +701,12 @@ class TopMongoResource(TopResource, Mongo):
 
     def get_top_resource(self) -> dict:
         area_dict = dict(ALL={"$regex": ".*"}, US="美国", JP="日本", KR="韩国", UK="英国")
-        all_data = {}
+        all_data = {"ALL": "全部"}
         for abbr, area in area_dict.items():
             data = self.db["yyets"].find({"data.info.area": area, "data.info.id": {"$ne": 233}}, self.projection). \
                 sort("data.info.views", pymongo.DESCENDING).limit(15)
             all_data[abbr] = list(data)
 
-        area_dict["ALL"] = "全部"
         all_data["class"] = area_dict
         return all_data
 
@@ -720,6 +768,9 @@ class UserMongoResource(UserResource, Mongo):
                 returned_value["message"] = "用户名或密码错误"
 
         else:
+            if os.getenv("DISABLE_REGISTER"):
+                return {"status_code": HTTPStatus.BAD_REQUEST, "message": "本站已经暂停注册"}
+
             # register
             hash_value = pbkdf2_sha256.hash(password)
             try:
@@ -755,34 +806,39 @@ class UserMongoResource(UserResource, Mongo):
             if data.get(field):
                 valid_data[field] = data[field]
 
-        if valid_data.get("email") and not re.findall(r"\S@\S", valid_data.get("email")):
-            return {"status_code": HTTPStatus.BAD_REQUEST, "status": False, "message": "email format error  "}
+        email_regex = r"@gmail\.com|@outlook\.com|@qq\.com|@163\.com"
+        if valid_data.get("email") and not re.findall(email_regex, valid_data.get("email"), re.IGNORECASE):
+            return {"status_code": HTTPStatus.BAD_REQUEST, "status": False, "message": "不支持的邮箱"}
         elif valid_data.get("email"):
             # rate limit
             user_email = valid_data.get("email")
-            timeout_key = f"timeout-{user_email}"
+            timeout_key = f"timeout-{username}"
             if redis.get(timeout_key):
                 return {"status_code": HTTPStatus.TOO_MANY_REQUESTS,
                         "status": False,
-                        "message": f"try again in {redis.ttl(timeout_key)}s"}
+                        "message": f"验证次数过多，请于{redis.ttl(timeout_key)}秒后尝试"}
 
             verify_code = random.randint(10000, 99999)
             valid_data["email"] = {"verified": False, "address": user_email}
             # send email confirm
             subject = "[人人影视下载分享站] 请验证你的邮箱"
-            body = f"{username} 您好，<br>请输入如下验证码完成你的邮箱认证。验证码有效期为24小时。<br>" \
+            text = f"请输入如下验证码完成你的邮箱认证。验证码有效期为24小时。<br>" \
                    f"如果您未有此请求，请忽略此邮件。<br><br>验证码： {verify_code}"
-
+            context = {
+                "username": username,
+                "text": text
+            }
+            send_mail(user_email, subject, context)
+            # 发送成功才设置缓存
             redis.set(timeout_key, username, ex=1800)
             redis.hset(user_email, mapping={"code": verify_code, "wrong": 0})
             redis.expire(user_email, 24 * 3600)
-            send_mail(user_email, subject, body)
 
         self.db["users"].update_one(
             {"username": username},
             {"$set": valid_data}
         )
-        return {"status_code": HTTPStatus.CREATED, "status": True, "message": "success"}
+        return {"status_code": HTTPStatus.CREATED, "status": True, "message": "邮件已经成功发送"}
 
 
 class DoubanMongoResource(DoubanResource, Mongo):
@@ -823,7 +879,7 @@ class DoubanMongoResource(DoubanResource, Mongo):
         douban_item = soup.find_all("div", class_="content")
 
         fwd_link = unquote(douban_item[0].a["href"])
-        douban_id = re.findall(r"https://movie.douban.com/subject/(\d*)/&query=", fwd_link)[0]
+        douban_id = re.findall(r"https://movie\.douban\.com/subject/(\d*)/.*", fwd_link)[0]
         final_data = self.get_craw_data(cname, douban_id, resource_id, search_html, session)
         douban_col.insert_one(final_data.copy())
         final_data.pop("raw")
@@ -911,7 +967,13 @@ class NotificationMongoResource(NotificationResource, Mongo):
         # .sort("_id", pymongo.DESCENDING).limit(size).skip((page - 1) * size)
         notify = self.db["notification"].find_one({"username": username}, projection={"_id": False})
         if not notify:
-            return {}
+            return {
+                "username": username,
+                "unread_item": [],
+                "read_item": [],
+                "unread_count": 0,
+                "read_count": 0
+            }
 
         # size is shared
         unread = notify.get("unread", [])
@@ -975,7 +1037,7 @@ class UserEmailMongoResource(UserEmailResource, Mongo):
             self.db["users"].update_one({"username": username},
                                         {"$set": {"status": {"disable": True, "reason": "verify email crack"}}}
                                         )
-            return {"status": False, "status_code": HTTPStatus.FORBIDDEN, "message": "Account locked. Please stay away"}
+            return {"status": False, "status_code": HTTPStatus.FORBIDDEN, "message": "账户已被封锁"}
         correct_code = verify_data["code"]
 
         if correct_code == code:
@@ -984,12 +1046,12 @@ class UserEmailMongoResource(UserEmailResource, Mongo):
             self.db["users"].update_one({"username": username},
                                         {"$set": {"email.verified": True}}
                                         )
-            return {"status": True, "status_code": HTTPStatus.CREATED, "message": "success"}
+            return {"status": True, "status_code": HTTPStatus.CREATED, "message": "邮箱已经验证成功"}
         else:
             r.hset(email, "wrong", wrong_count + 1)
             return {"status": False,
                     "status_code": HTTPStatus.FORBIDDEN,
-                    "message": f"verification code is incorrect. You have {MAX - wrong_count} attempts remaining"}
+                    "message": f"验证码不正确。你还可以尝试 {MAX - wrong_count} 次"}
 
 
 class CategoryMongoResource(CategoryResource, Mongo):
@@ -1069,10 +1131,14 @@ class ResourceLatestMongoResource(ResourceLatestResource, Mongo):
 
 class SpamProcessMongoResource(Mongo):
 
-    def delete_spam(self, obj_id: "str"):
+    def ban_spam(self, obj_id: "str"):
         obj_id = ObjectId(obj_id)
         logging.info("Deleting spam %s", obj_id)
-        self.db["spam"].delete_one({"_id": obj_id})
+        spam = self.db["spam"].find_one({"_id": obj_id})
+        username = spam["username"]
+        self.db["spam"].delete_many({"username": username})
+        # self.db["comment"].delete_many({"username": username})
+        cf.ban_new_ip(spam["ip"])
         return {"status": True}
 
     def restore_spam(self, obj_id: "str"):
@@ -1099,8 +1165,8 @@ class SpamProcessMongoResource(Mongo):
                             "callback_data": f"approve{obj_id}"
                         },
                         {
-                            "text": "deny",
-                            "callback_data": f"deny{obj_id}"
+                            "text": "ban",
+                            "callback_data": f"ban{obj_id}"
                         }
                     ]
                 ]
